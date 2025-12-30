@@ -25,6 +25,32 @@ Run a synthetic demo with padding-only vs padding+payload:
 python main.py demo
 ```
 
+## Commands
+
+- `analyze`: compute adjusted complexity metrics for packets
+- `inspect`: show details for a flagged packet (or a specific index)
+- `demo`: generate synthetic sparse packets with and without payloads
+
+Common options:
+
+- `-i/--input`: input file path or `-` for stdin
+- `-f/--format`: `hex`, `binary`, `text`, or `raw`
+- `--encoding`: text encoding when `--format=text`
+- `--skip-bytes`: skip bytes before analysis
+- `--chunk-size`: chunk size for `--format=raw`
+
+Inspect-specific options:
+
+- `--packet-index`: 1-based index to inspect (defaults to first flagged)
+- `--pcap`: optional PCAP file to decode the selected packet
+- `--pcap-verbose`: verbose `tshark` decode output
+
+Demo-specific options:
+
+- `--packet-bytes`: total bytes per synthetic packet
+- `--payload-bytes`: bytes of random payload hidden in the padding
+- `--seed`: random seed for reproducible payloads
+
 ## Input formats
 
 - `hex`: hex string per line (whitespace and `0x` prefixes allowed)
