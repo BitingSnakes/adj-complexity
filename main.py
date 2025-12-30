@@ -1,10 +1,13 @@
-import argparse
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Annotated, Iterable, List, Sequence
 
 import numpy as np
+import typer
 
 from adjusted_complexity import AdjustedComplexityCalculator
 
@@ -31,6 +34,15 @@ def bytes_to_bits(data: bytes) -> np.ndarray:
     if not data:
         return np.array([], dtype=np.uint8)
     return np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+
+
+def bits_to_bytes(bits: np.ndarray) -> tuple[bytes, int]:
+    if bits.size == 0:
+        return b"", 0
+    pad_bits = (-bits.size) % 8
+    if pad_bits:
+        bits = np.pad(bits, (0, pad_bits), constant_values=0)
+    return np.packbits(bits).tobytes(), pad_bits
 
 
 def _skip_bytes(data: bytes, skip_bytes: int) -> bytes:
@@ -143,6 +155,59 @@ def analyze_packets(
     return results
 
 
+def load_packets(
+    input_path: str,
+    format_name: str,
+    encoding: str,
+    skip_bytes: int,
+    chunk_size: int,
+    max_packets: int,
+) -> List[np.ndarray]:
+    packets: List[np.ndarray] = []
+    if format_name == "raw":
+        data = read_bytes(input_path)
+        data = _skip_bytes(data, skip_bytes)
+        for chunk in chunk_bytes(data, chunk_size):
+            bits = bytes_to_bits(chunk)
+            if bits.size:
+                packets.append(bits)
+    else:
+        lines = read_text_lines(input_path, encoding)
+        for line in lines:
+            if not line.strip():
+                continue
+            if format_name == "binary":
+                bits = parse_binary_line(line, skip_bytes)
+            elif format_name == "hex":
+                bits = parse_hex_line(line, skip_bytes)
+            else:
+                bits = parse_text_line(line, encoding, skip_bytes)
+            if bits.size:
+                packets.append(bits)
+
+    if max_packets > 0:
+        return packets[:max_packets]
+    return packets
+
+
+def format_packet_details(bits: np.ndarray, metrics: PacketMetrics) -> str:
+    data, pad_bits = bits_to_bytes(bits)
+    lines = [
+        f"Packet {metrics.index}",
+        f"Flagged: {metrics.flagged}",
+        f"Bits: {metrics.bit_length} (padded {pad_bits} bits for byte view)",
+        f"Ones: {metrics.ones}",
+        f"Density: {metrics.density:.6f}",
+        f"Entropy: {metrics.entropy:.6f}",
+    ]
+    ratio = "inf" if np.isinf(metrics.ratio) else f"{metrics.ratio:.6f}"
+    deficiency = "inf" if np.isinf(metrics.deficiency) else f"{metrics.deficiency:.6f}"
+    lines.append(f"Ratio: {ratio}")
+    lines.append(f"Deficiency: {deficiency}")
+    lines.append(f"Hex: {data.hex()}")
+    return "\n".join(lines)
+
+
 def format_metrics(metrics: Sequence[PacketMetrics]) -> str:
     header = "idx  bits  ones  density  entropy  ratio    deficiency  flag"
     lines = [header, "-" * len(header)]
@@ -174,153 +239,165 @@ def summarize(metrics: Sequence[PacketMetrics]) -> str:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=("Analyze sparse network data with the Adjusted Complexity Ratio.")
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    analyze_parser = subparsers.add_parser(
-        "analyze",
-        help="Compute adjusted complexity metrics for packets.",
-    )
-    analyze_parser.add_argument(
-        "-i",
-        "--input",
-        default="-",
-        help="Input file path or '-' for stdin.",
-    )
-    analyze_parser.add_argument(
-        "-f",
-        "--format",
-        choices=("hex", "binary", "text", "raw"),
-        default="hex",
-        help="Input format for each packet.",
-    )
-    analyze_parser.add_argument(
-        "--encoding",
-        default="utf-8",
-        help="Text encoding when --format=text.",
-    )
-    analyze_parser.add_argument(
-        "--skip-bytes",
-        type=int,
-        default=0,
-        help="Skip this many bytes before analysis.",
-    )
-    analyze_parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=0,
-        help="Split raw input into chunks of this many bytes.",
-    )
-    analyze_parser.add_argument(
-        "--ratio-min",
-        type=float,
-        default=1.4,
-        help="Minimum adjusted ratio required to flag a packet.",
-    )
-    analyze_parser.add_argument(
-        "--entropy-max",
-        type=float,
-        default=0.35,
-        help="Maximum entropy required to flag a packet.",
-    )
-    analyze_parser.add_argument(
-        "--no-flags",
-        action="store_true",
-        help="Disable flagging logic.",
-    )
-    analyze_parser.add_argument(
-        "--max-packets",
-        type=int,
-        default=0,
-        help="Stop after analyzing this many packets.",
-    )
-
-    demo_parser = subparsers.add_parser(
-        "demo",
-        help="Generate synthetic sparse packets with and without payloads.",
-    )
-    demo_parser.add_argument(
-        "--packet-bytes",
-        type=int,
-        default=64,
-        help="Total bytes per synthetic packet.",
-    )
-    demo_parser.add_argument(
-        "--payload-bytes",
-        type=int,
-        default=8,
-        help="Bytes of random payload hidden in the padding.",
-    )
-    demo_parser.add_argument(
-        "--seed",
-        type=int,
-        default=7,
-        help="Random seed for reproducible payloads.",
-    )
-    return parser
+class InputFormat(str, Enum):
+    hex = "hex"
+    binary = "binary"
+    text = "text"
+    raw = "raw"
 
 
-def run_analyze(args: argparse.Namespace) -> int:
-    packets: List[np.ndarray] = []
-    if args.format == "raw":
-        data = read_bytes(args.input)
-        data = _skip_bytes(data, args.skip_bytes)
-        for chunk in chunk_bytes(data, args.chunk_size):
-            bits = bytes_to_bits(chunk)
-            if bits.size:
-                packets.append(bits)
-    else:
-        lines = read_text_lines(args.input, args.encoding)
-        for line in lines:
-            if not line.strip():
-                continue
-            if args.format == "binary":
-                bits = parse_binary_line(line, args.skip_bytes)
-            elif args.format == "hex":
-                bits = parse_hex_line(line, args.skip_bytes)
-            else:
-                bits = parse_text_line(line, args.encoding, args.skip_bytes)
-            if bits.size:
-                packets.append(bits)
+app = typer.Typer(
+    help="Analyze sparse network data with the Adjusted Complexity Ratio."
+)
 
-    if args.max_packets > 0:
-        packets = packets[: args.max_packets]
+
+def run_analyze(
+    input_path: str,
+    format_name: InputFormat,
+    encoding: str,
+    skip_bytes: int,
+    chunk_size: int,
+    ratio_min: float,
+    entropy_max: float,
+    no_flags: bool,
+    max_packets: int,
+) -> int:
+    packets = load_packets(
+        input_path=input_path,
+        format_name=format_name.value,
+        encoding=encoding,
+        skip_bytes=skip_bytes,
+        chunk_size=chunk_size,
+        max_packets=max_packets,
+    )
 
     metrics = analyze_packets(
         packets,
-        ratio_min=args.ratio_min,
-        entropy_max=args.entropy_max,
-        apply_flags=not args.no_flags,
+        ratio_min=ratio_min,
+        entropy_max=entropy_max,
+        apply_flags=not no_flags,
     )
     print(format_metrics(metrics))
     print(summarize(metrics))
     return 0
 
 
-def run_demo(args: argparse.Namespace) -> int:
-    if args.payload_bytes > args.packet_bytes:
-        raise ValueError("payload-bytes must be <= packet-bytes")
+def run_inspect(
+    input_path: str,
+    format_name: InputFormat,
+    encoding: str,
+    skip_bytes: int,
+    chunk_size: int,
+    ratio_min: float,
+    entropy_max: float,
+    packet_index: int,
+    pcap: str,
+    pcap_verbose: bool,
+    max_packets: int,
+) -> int:
+    packets = load_packets(
+        input_path=input_path,
+        format_name=format_name.value,
+        encoding=encoding,
+        skip_bytes=skip_bytes,
+        chunk_size=chunk_size,
+        max_packets=max_packets,
+    )
 
-    rng = np.random.default_rng(args.seed)
-    padding_len = args.packet_bytes - args.payload_bytes
+    metrics = analyze_packets(
+        packets,
+        ratio_min=ratio_min,
+        entropy_max=entropy_max,
+        apply_flags=True,
+    )
+    if not metrics:
+        print("No packets analyzed.")
+        return 0
+
+    if packet_index > 0:
+        selected = next(
+            (m for m in metrics if m.index == packet_index),
+            None,
+        )
+        if selected is None:
+            print(f"Packet index {packet_index} not found.")
+            return 1
+    else:
+        selected = next((m for m in metrics if m.flagged), None)
+        if selected is None:
+            print("No packets flagged with the current thresholds.")
+            return 0
+
+    bits = packets[selected.index - 1]
+    print(format_packet_details(bits, selected))
+    if pcap:
+        tshark = shutil.which("tshark")
+        if not tshark:
+            print("tshark not found; install Wireshark to decode PCAP packets.")
+            return 0
+        frame_number = selected.index
+        if pcap_verbose:
+            cmd = [
+                tshark,
+                "-r",
+                pcap,
+                "-Y",
+                f"frame.number=={frame_number}",
+                "-V",
+            ]
+        else:
+            cmd = [
+                tshark,
+                "-r",
+                pcap,
+                "-Y",
+                f"frame.number=={frame_number}",
+            ]
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            message = exc.stderr.strip() or exc.stdout.strip()
+            print(f"tshark failed: {message or 'unknown error'}")
+            return 1
+        output = result.stdout.strip()
+        if not output:
+            print("tshark returned no output for that packet.")
+        else:
+            print("\nPCAP decode:")
+            print(output)
+    return 0
+
+
+def run_demo(
+    packet_bytes: int,
+    payload_bytes: int,
+    seed: int,
+) -> int:
+    if payload_bytes > packet_bytes:
+        raise typer.BadParameter("payload-bytes must be <= packet-bytes")
+
+    rng = np.random.default_rng(seed)
+    padding_len = packet_bytes - payload_bytes
     padding = bytes([0] * padding_len)
 
     payload = rng.integers(
         0,
         256,
-        size=args.payload_bytes,
+        size=payload_bytes,
         dtype=np.uint8,
     ).tobytes()
 
-    packet_padding_only = padding + bytes([0] * args.payload_bytes)
+    packet_padding_only = padding + bytes([0] * payload_bytes)
     packet_with_payload = padding + payload
     packet_random = rng.integers(
         0,
         256,
-        size=args.packet_bytes,
+        size=packet_bytes,
         dtype=np.uint8,
     ).tobytes()
 
@@ -344,16 +421,132 @@ def run_demo(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "analyze":
-        return run_analyze(args)
-    if args.command == "demo":
-        return run_demo(args)
-    parser.error("Unknown command")
-    return 2
+@app.command()
+def analyze(
+    input_path: Annotated[
+        str, typer.Option("-i", "--input", help="Input file path or '-' for stdin.")
+    ] = "-",
+    format_name: Annotated[
+        InputFormat,
+        typer.Option("-f", "--format", help="Input format for each packet."),
+    ] = InputFormat.hex,
+    encoding: Annotated[
+        str, typer.Option(help="Text encoding when --format=text.")
+    ] = "utf-8",
+    skip_bytes: Annotated[
+        int, typer.Option(help="Skip this many bytes before analysis.")
+    ] = 0,
+    chunk_size: Annotated[
+        int, typer.Option(help="Split raw input into chunks of this many bytes.")
+    ] = 0,
+    ratio_min: Annotated[
+        float, typer.Option(help="Minimum adjusted ratio required to flag a packet.")
+    ] = 1.4,
+    entropy_max: Annotated[
+        float, typer.Option(help="Maximum entropy required to flag a packet.")
+    ] = 0.35,
+    no_flags: Annotated[
+        bool,
+        typer.Option("--no-flags", help="Disable flagging logic.", is_flag=True),
+    ] = False,
+    max_packets: Annotated[
+        int, typer.Option(help="Stop after analyzing this many packets.")
+    ] = 0,
+) -> None:
+    code = run_analyze(
+        input_path=input_path,
+        format_name=format_name,
+        encoding=encoding,
+        skip_bytes=skip_bytes,
+        chunk_size=chunk_size,
+        ratio_min=ratio_min,
+        entropy_max=entropy_max,
+        no_flags=no_flags,
+        max_packets=max_packets,
+    )
+    raise typer.Exit(code=code)
+
+
+@app.command()
+def inspect(
+    input_path: Annotated[
+        str, typer.Option("-i", "--input", help="Input file path or '-' for stdin.")
+    ] = "-",
+    format_name: Annotated[
+        InputFormat,
+        typer.Option("-f", "--format", help="Input format for each packet."),
+    ] = InputFormat.hex,
+    encoding: Annotated[
+        str, typer.Option(help="Text encoding when --format=text.")
+    ] = "utf-8",
+    skip_bytes: Annotated[
+        int, typer.Option(help="Skip this many bytes before analysis.")
+    ] = 0,
+    chunk_size: Annotated[
+        int, typer.Option(help="Split raw input into chunks of this many bytes.")
+    ] = 0,
+    ratio_min: Annotated[
+        float, typer.Option(help="Minimum adjusted ratio required to flag a packet.")
+    ] = 1.4,
+    entropy_max: Annotated[
+        float, typer.Option(help="Maximum entropy required to flag a packet.")
+    ] = 0.35,
+    packet_index: Annotated[
+        int,
+        typer.Option(
+            help="1-based packet index to inspect (defaults to first flagged)."
+        ),
+    ] = 0,
+    pcap: Annotated[
+        str, typer.Option(help="Optional PCAP file to decode the selected packet.")
+    ] = "",
+    pcap_verbose: Annotated[
+        bool,
+        typer.Option(
+            "--pcap-verbose",
+            help="Show verbose tshark decode when --pcap is provided.",
+            is_flag=True,
+        ),
+    ] = False,
+    max_packets: Annotated[
+        int, typer.Option(help="Stop after analyzing this many packets.")
+    ] = 0,
+) -> None:
+    code = run_inspect(
+        input_path=input_path,
+        format_name=format_name,
+        encoding=encoding,
+        skip_bytes=skip_bytes,
+        chunk_size=chunk_size,
+        ratio_min=ratio_min,
+        entropy_max=entropy_max,
+        packet_index=packet_index,
+        pcap=pcap,
+        pcap_verbose=pcap_verbose,
+        max_packets=max_packets,
+    )
+    raise typer.Exit(code=code)
+
+
+@app.command()
+def demo(
+    packet_bytes: Annotated[
+        int, typer.Option(help="Total bytes per synthetic packet.")
+    ] = 64,
+    payload_bytes: Annotated[
+        int, typer.Option(help="Bytes of random payload hidden in the padding.")
+    ] = 8,
+    seed: Annotated[
+        int, typer.Option(help="Random seed for reproducible payloads.")
+    ] = 7,
+) -> None:
+    code = run_demo(
+        packet_bytes=packet_bytes,
+        payload_bytes=payload_bytes,
+        seed=seed,
+    )
+    raise typer.Exit(code=code)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    app()
